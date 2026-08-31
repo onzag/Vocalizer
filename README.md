@@ -38,7 +38,7 @@ cd vocalizer
 pip install -r requirements.txt
 ```
 
-Requires Python 3.9+. VoxCPM2 will download on first run unless you point
+Requires Python 3.9+ and less than 3.12. VoxCPM2 will download on first run unless you point
 `--model-id` at a local path.
 
 ## Usage

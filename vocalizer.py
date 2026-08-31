@@ -85,7 +85,7 @@ def _ensure_stereo_shape(x: np.ndarray) -> np.ndarray:
     return x[:, :2]
 
 
-def load_wav(path: str, target_sr: int, target_dbfs: Optional[float] = None) -> np.ndarray:
+def load_audio(path: str, target_sr: int, target_dbfs: Optional[float] = None) -> np.ndarray:
     data, sr = sf.read(path, dtype="float32", always_2d=False)
     data = _to_float32(data)
     if data.ndim == 1:
@@ -228,7 +228,7 @@ def render_background_track(background_cfg: dict, markers: list, offsets: list,
             env = env_natural
         env = env[:contrib_len]
 
-        bg_audio = load_wav(library.path_for(file), sr, target_dbfs)
+        bg_audio = load_audio(library.path_for(file), sr, target_dbfs)
         bg_looped = loop_to_length(bg_audio, contrib_len)
         contribution = bg_looped[:contrib_len] * env[:, None]
 
@@ -331,7 +331,7 @@ class Vocalizer:
         clips = []
         for i in range(repeat):
             path = self.library.pick(pattern, randomize=randomize, index=i)
-            clip = load_wav(path, self.config.output_sample_rate, self.config.target_loudness_db)
+            clip = load_audio(path, self.config.output_sample_rate, self.config.target_loudness_db)
             clips.append(clip * resolve_volume_spec(volume_jitter if volume_jitter else volume))
 
         return crossfade_concat(clips, self.config.output_sample_rate, self.config.crossfade_ms)
@@ -349,15 +349,15 @@ class Vocalizer:
             return self._render_library_clip(segment)
         return self._render_delay(segment)
 
-    def render_script(self, script: Union[list, dict]) -> np.ndarray:
-        if isinstance(script, list):
-            segments = script
+    def render_json(self, jsonv: Union[list, dict]) -> np.ndarray:
+        if isinstance(jsonv, list):
+            segments = jsonv
             background_cfg = None
             script_generation = {}
         else:
-            segments = script.get("segments", [])
-            background_cfg = script.get("background")
-            script_generation = script.get("generation", {})
+            segments = jsonv.get("segments", [])
+            background_cfg = jsonv.get("background")
+            script_generation = jsonv.get("generation", {})
 
         clips = []
         markers = []
@@ -392,7 +392,7 @@ class Vocalizer:
             mixed = mixed / peak
         return mixed
 
-    def render_to_file(self, script: Union[list, dict], output_path: str) -> str:
-        audio = self.render_script(script)
+    def render_json_to_file(self, jsonv: Union[list, dict], output_path: str) -> str:
+        audio = self.render_json(jsonv)
         sf.write(output_path, audio, self.config.output_sample_rate)
         return output_path

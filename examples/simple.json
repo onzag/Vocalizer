@@ -1,0 +1,15 @@
+{
+  "generation": {
+    "cfg_value": 2.0,
+    "inference_timesteps": 10,
+    "normalize": true
+  },
+
+  "segments": [
+    {
+      "voice_prompt": "an older man, gravelly voice, speaking slowly",
+      "text": "Now let me show you something interesting.",
+      "volume": 6
+    }
+  ]
+}
