@@ -25,3 +25,9 @@ models/
 .DS_Store
 .idea/
 .vscode/
+
+# Secret
+
+*.pem
+*.key
+secret

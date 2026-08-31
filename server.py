@@ -1,0 +1,508 @@
+# Vocalizer WebSocket server.
+#
+# Spins up a local TLS (wss://) WebSocket server that renders Vocalizer JSON
+# scenes to audio and streams the encoded result back to the client. Modelled
+# after de-server/local-llama.py.
+#
+# Vocalizer only has a Python implementation, so there is no JS counterpart.
+#
+# Security note: this uses a simple shared-secret ("secret" file) mechanism and
+# is intended for use with a trusted group. Put a real proxy in front for
+# untrusted/public deployments.
+#
+# Per-connection behaviour:
+#   * Each connection gets a private temporary directory. Uploaded audio files
+#     land there and JSON scene references (file/ref) resolve relative to it.
+#   * The directory is destroyed when the client disconnects.
+#   * The directory is capped at MAX_DIR_BYTES (least-recently-used files are
+#     evicted). Files unused for FILE_TTL_SECONDS are also cleaned up.
+#
+# Render jobs from all clients are serialized through a single FIFO queue so the
+# (GPU-bound) model is only ever running one render at a time.
+
+import asyncio
+import hashlib
+import io
+import json as _json_mod
+import os
+import secrets
+import shutil
+import ssl
+import sys
+import tempfile
+import time
+from email.utils import formatdate
+from http import HTTPStatus
+from urllib.parse import urlparse, parse_qs
+
+import numpy as np
+import soundfile as sf
+import websockets
+from websockets.http11 import Response
+from websockets.datastructures import Headers
+
+from vocalizer import Vocalizer, VocalizerConfig, SoundLibrary
+
+# ── Configuration ─────────────────────────────────────────────────────────
+PORT = 8222
+HOST = "0.0.0.0"
+
+DEV = os.getenv("DEV", "0") == "1"
+
+MAX_UPLOAD_BYTES = 1 * 1024 * 1024        # 1 MB hard cap per uploaded file
+MAX_DIR_BYTES = 100 * 1024 * 1024         # 100 MB per-connection quota
+FILE_TTL_SECONDS = 30 * 60                # evict files unused for 30 minutes
+CLEANUP_INTERVAL_SECONDS = 60             # how often the janitor task runs
+STREAM_CHUNK_BYTES = 64 * 1024            # size of binary frames sent to client
+
+SUPPORTED_OUTPUT_FORMATS = {"ogg": "OGG", "mp3": "MP3"}
+
+MODEL_ID = os.getenv("VOCALIZER_MODEL_ID", "openbmb/VoxCPM2")
+SAMPLE_RATE = int(os.getenv("VOCALIZER_SAMPLE_RATE", "48000"))
+
+SERVER_START_TIME = time.time()
+
+# The single shared Vocalizer instance (model loaded once).
+VOCALIZER: Vocalizer = None  # set in main()
+
+# FIFO render queue shared by every client.
+RENDER_QUEUE: "asyncio.Queue" = None  # created inside main()
+
+# Registry of active connections, used by the cleanup janitor.
+ACTIVE_CONNECTIONS = set()
+
+
+# ── Static info page ──────────────────────────────────────────────────────
+_INDEX_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+try:
+    with open(_INDEX_HTML_PATH, "r", encoding="utf-8") as _f:
+        INDEX_HTML_TEMPLATE = _f.read()
+except Exception as _e:
+    print(f"Warning: failed to load index.html template: {_e}")
+    INDEX_HTML_TEMPLATE = "<html><body><h1>Vocalizer Server</h1><p>(template missing)</p></body></html>"
+
+
+def _html_escape(s: str) -> str:
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def _format_uptime(seconds: float) -> str:
+    s = int(seconds)
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, sec = divmod(s, 60)
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h or d:
+        parts.append(f"{h}h")
+    if m or h or d:
+        parts.append(f"{m}m")
+    parts.append(f"{sec}s")
+    return " ".join(parts)
+
+
+def _mb(n: int) -> str:
+    return f"{n / (1024 * 1024):.0f} MB"
+
+
+def _render_index_html() -> str:
+    replacements = {
+        "PROTOCOL": "wss",
+        "PORT": str(PORT),
+        "DEV_MODE": "DEV (insecure secret)" if DEV else "production",
+        "SSL_MODE": "enabled",
+        "MODEL_LOADED": "yes" if (VOCALIZER is not None and VOCALIZER.model is not None) else "no",
+        "MODEL_ID": _html_escape(MODEL_ID),
+        "SAMPLE_RATE": str(SAMPLE_RATE),
+        "OUTPUT_FORMATS": ", ".join(SUPPORTED_OUTPUT_FORMATS.keys()),
+        "MAX_UPLOAD": _mb(MAX_UPLOAD_BYTES),
+        "MAX_DIR": _mb(MAX_DIR_BYTES),
+        "ACTIVE_SESSIONS": str(len(ACTIVE_CONNECTIONS)),
+        "QUEUE_LEN": str(RENDER_QUEUE.qsize() if RENDER_QUEUE is not None else 0),
+        "UPTIME": _format_uptime(time.time() - SERVER_START_TIME),
+    }
+    out = INDEX_HTML_TEMPLATE
+    for key, value in replacements.items():
+        out = out.replace("{{" + key + "}}", str(value))
+    return out
+
+
+# ── Per-connection session (temp dir + upload bookkeeping) ─────────────────
+class Session:
+    """Holds the private temp directory and upload state for one connection."""
+
+    def __init__(self):
+        self.dir = tempfile.mkdtemp(prefix="vocalizer_")
+        # filename -> {"hash": str, "size": int, "last_used": float}
+        self.files = {}
+        # Set while awaiting a binary frame after an upload_audio_proceed.
+        self.pending_upload = None  # {"filename": str, "hash": str}
+
+    # -- filename safety -------------------------------------------------
+    @staticmethod
+    def _safe_name(filename: str) -> str:
+        """Reject path traversal; only a plain basename is allowed."""
+        if not filename or not isinstance(filename, str):
+            raise ValueError("Invalid filename")
+        base = os.path.basename(filename)
+        if base != filename or base in ("", ".", ".."):
+            raise ValueError("Invalid filename (no paths allowed)")
+        return base
+
+    def path_for(self, filename: str) -> str:
+        return os.path.join(self.dir, self._safe_name(filename))
+
+    # -- upload lifecycle ------------------------------------------------
+    def has_matching(self, filename: str, sha256_hex: str) -> bool:
+        name = self._safe_name(filename)
+        info = self.files.get(name)
+        if not info or info["hash"] != sha256_hex:
+            return False
+        # Confirm the file is still physically present.
+        if not os.path.isfile(self.path_for(name)):
+            self.files.pop(name, None)
+            return False
+        info["last_used"] = time.time()
+        return True
+
+    def store_upload(self, filename: str, data: bytes, expected_hash: str) -> str:
+        name = self._safe_name(filename)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise ValueError(f"Upload exceeds {MAX_UPLOAD_BYTES} bytes limit")
+        actual_hash = hashlib.sha256(data).hexdigest()
+        if expected_hash and actual_hash != expected_hash:
+            raise ValueError("Uploaded data hash does not match declared hash")
+        path = self.path_for(name)
+        with open(path, "wb") as f:
+            f.write(data)
+        self.files[name] = {"hash": actual_hash, "size": len(data), "last_used": time.time()}
+        self._enforce_quota()
+        return actual_hash
+
+    def touch_all(self):
+        """Mark every file as recently used (called at render time)."""
+        now = time.time()
+        for info in self.files.values():
+            info["last_used"] = now
+
+    def _total_bytes(self) -> int:
+        return sum(info["size"] for info in self.files.values())
+
+    def _enforce_quota(self):
+        """Evict least-recently-used files until under MAX_DIR_BYTES."""
+        while self._total_bytes() > MAX_DIR_BYTES and self.files:
+            oldest = min(self.files.items(), key=lambda kv: kv[1]["last_used"])[0]
+            self._remove(oldest)
+
+    def cleanup_expired(self):
+        """Delete files not used within FILE_TTL_SECONDS."""
+        now = time.time()
+        expired = [name for name, info in self.files.items()
+                   if now - info["last_used"] > FILE_TTL_SECONDS]
+        for name in expired:
+            self._remove(name)
+
+    def _remove(self, name: str):
+        try:
+            os.remove(self.path_for(name))
+        except OSError:
+            pass
+        self.files.pop(name, None)
+
+    def destroy(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+        self.files.clear()
+
+
+# ── Rendering ──────────────────────────────────────────────────────────────
+def _encode_audio(audio: np.ndarray, output_format: str) -> bytes:
+    """Encode a rendered audio array to the requested container as bytes."""
+    sf_format = SUPPORTED_OUTPUT_FORMATS[output_format]
+    buffer = io.BytesIO()
+    sf.write(buffer, audio, VOCALIZER.config.output_sample_rate, format=sf_format)
+    return buffer.getvalue()
+
+
+def _render_blocking(payload: dict, session_dir: str) -> np.ndarray:
+    """Runs on an executor thread. Points the shared Vocalizer's library at the
+    connection's temp dir so file/ref references resolve to uploaded files."""
+    VOCALIZER.library = SoundLibrary(session_dir)
+    VOCALIZER.config.sound_library_dir = session_dir
+    return VOCALIZER.render_json(payload)
+
+
+async def _render_worker():
+    """Single consumer of RENDER_QUEUE. Guarantees FIFO, one render at a time."""
+    loop = asyncio.get_event_loop()
+    while True:
+        job = await RENDER_QUEUE.get()
+        websocket = job["websocket"]
+        rid = job["rid"]
+        payload = job["payload"]
+        output_format = job["output_format"]
+        session = job["session"]
+        future = job["future"]
+        try:
+            session.touch_all()
+            audio = await loop.run_in_executor(None, _render_blocking, payload, session.dir)
+            data = await loop.run_in_executor(None, _encode_audio, audio, output_format)
+
+            await websocket.send(_json({"type": "render_start", "rid": rid, "format": output_format}))
+            for i in range(0, len(data), STREAM_CHUNK_BYTES):
+                await websocket.send(data[i:i + STREAM_CHUNK_BYTES])
+            await websocket.send(_json({"type": "render_done", "rid": rid, "bytes": len(data)}))
+            if not future.done():
+                future.set_result(True)
+        except Exception as e:
+            try:
+                await websocket.send(_json({"type": "error", "rid": rid, "message": str(e)}))
+            except Exception:
+                pass
+            if not future.done():
+                future.set_result(False)
+        finally:
+            RENDER_QUEUE.task_done()
+
+
+# ── WebSocket handling ─────────────────────────────────────────────────────
+def _json(obj) -> str:
+    return _json_mod.dumps(obj)
+
+
+async def handle_client(websocket):
+    print("Client connected")
+    session = Session()
+    ACTIVE_CONNECTIONS.add(session)
+
+    await websocket.send(_json({
+        "type": "ready",
+        "message": "Vocalizer is ready",
+        "supported_output_formats": list(SUPPORTED_OUTPUT_FORMATS.keys()),
+        "max_upload_bytes": MAX_UPLOAD_BYTES,
+        "max_session_bytes": MAX_DIR_BYTES,
+        "file_ttl_seconds": FILE_TTL_SECONDS,
+        "sample_rate": VOCALIZER.config.output_sample_rate,
+        "supports_parallel_requests": False,
+    }))
+
+    try:
+        async for message in websocket:
+            # ── Binary frame: the payload of a pending upload ──────────
+            if isinstance(message, (bytes, bytearray)):
+                await _handle_binary(websocket, session, bytes(message))
+                continue
+
+            # ── Text frame: a JSON control message ─────────────────────
+            rid = "no-rid"
+            try:
+                data = _json_mod.loads(message)
+                rid = data.get("rid", "no-rid")
+                action = data.get("action")
+
+                if action == "upload_audio":
+                    await _handle_upload_request(websocket, session, data, rid)
+                elif action == "render_json":
+                    await _handle_render_request(websocket, session, data, rid)
+                elif action == "ping":
+                    await websocket.send(_json({"type": "pong", "rid": rid}))
+                else:
+                    await websocket.send(_json({
+                        "type": "error", "rid": rid,
+                        "message": f"Unknown action: {action}",
+                    }))
+            except Exception as e:
+                print(f"Error handling message: {e}")
+                await websocket.send(_json({"type": "error", "rid": rid, "message": str(e)}))
+    except websockets.ConnectionClosedOK:
+        print("Client disconnected normally")
+    except websockets.ConnectionClosedError as e:
+        print(f"Client disconnected abnormally: code={e.code} reason={e.reason}")
+    finally:
+        ACTIVE_CONNECTIONS.discard(session)
+        session.destroy()
+        print("Session cleaned up")
+
+
+async def _handle_upload_request(websocket, session: Session, data: dict, rid: str):
+    filename = data.get("filename")
+    sha256_hex = data.get("hash")
+    if not filename or not sha256_hex:
+        raise ValueError("upload_audio requires 'filename' and 'hash'")
+
+    # Validate the name early (raises on traversal attempts).
+    session._safe_name(filename)
+
+    if session.has_matching(filename, sha256_hex):
+        # Already present with the same hash; the client can skip sending it.
+        session.pending_upload = None
+        await websocket.send(_json({
+            "type": "upload_audio_skip", "rid": rid, "filename": filename,
+        }))
+    else:
+        # Await one binary frame carrying the file bytes.
+        session.pending_upload = {"filename": filename, "hash": sha256_hex, "rid": rid}
+        await websocket.send(_json({
+            "type": "upload_audio_proceed", "rid": rid, "filename": filename,
+        }))
+
+
+async def _handle_binary(websocket, session: Session, data: bytes):
+    pending = session.pending_upload
+    if not pending:
+        await websocket.send(_json({
+            "type": "error", "rid": "no-rid",
+            "message": "Unexpected binary frame (no upload in progress)",
+        }))
+        return
+    session.pending_upload = None
+    rid = pending.get("rid", "no-rid")
+    try:
+        actual_hash = session.store_upload(pending["filename"], data, pending["hash"])
+        await websocket.send(_json({
+            "type": "upload_audio_done", "rid": rid,
+            "filename": pending["filename"], "hash": actual_hash,
+            "size": len(data),
+        }))
+    except Exception as e:
+        await websocket.send(_json({"type": "error", "rid": rid, "message": str(e)}))
+
+
+async def _handle_render_request(websocket, session: Session, data: dict, rid: str):
+    payload = data.get("payload")
+    if not payload:
+        raise ValueError("render_json requires a 'payload'")
+    output_format = (data.get("output_format") or "ogg").lower()
+    if output_format not in SUPPORTED_OUTPUT_FORMATS:
+        raise ValueError(
+            f"Unsupported output_format '{output_format}' "
+            f"(supported: {', '.join(SUPPORTED_OUTPUT_FORMATS.keys())})"
+        )
+
+    future = asyncio.get_event_loop().create_future()
+    position = RENDER_QUEUE.qsize()
+    await RENDER_QUEUE.put({
+        "websocket": websocket,
+        "rid": rid,
+        "payload": payload,
+        "output_format": output_format,
+        "session": session,
+        "future": future,
+    })
+    await websocket.send(_json({"type": "queued", "rid": rid, "position": position}))
+    # Wait for this job to finish so we don't interleave two renders on one socket.
+    await future
+
+
+# ── Background janitor ─────────────────────────────────────────────────────
+async def _cleanup_task():
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+        for session in list(ACTIVE_CONNECTIONS):
+            try:
+                session.cleanup_expired()
+            except Exception as e:
+                print(f"Cleanup error: {e}")
+
+
+# ── HTTP handshake / info page / auth ──────────────────────────────────────
+async def process_request(connection, request):
+    parsed = urlparse(request.path)
+
+    is_websocket = request.headers.get("Upgrade", "").lower() == "websocket"
+
+    # Serve the info page only for ordinary browser (non-WebSocket) requests to
+    # the root. WebSocket upgrades on any path fall through to auth + handshake.
+    if not is_websocket and parsed.path in ("/", "/index.html"):
+        body = _render_index_html().encode("utf-8")
+        headers = Headers([
+            ("Date", formatdate(usegmt=True)),
+            ("Connection", "close"),
+            ("Content-Type", "text/html; charset=utf-8"),
+            ("Cache-Control", "no-store"),
+            ("Content-Length", str(len(body))),
+        ])
+        return Response(HTTPStatus.OK.value, HTTPStatus.OK.phrase, headers, body)
+
+    # Any plain HTTP request on an unknown path (e.g. /favicon.ico) gets a
+    # silent 404. Only WebSocket upgrade requests proceed to auth.
+    if not is_websocket:
+        return connection.respond(HTTPStatus.NOT_FOUND, "Not found")
+
+    query_params = parse_qs(parsed.query)
+    secret = query_params.get("secret", [None])[0]
+
+    if not DEV:
+        try:
+            with open("./secret", "r") as f:
+                expected_secret = f.read().strip()
+        except Exception:
+            expected_secret = secrets.token_hex(64)
+            with open("./secret", "w") as f:
+                f.write(expected_secret)
+            print(f"Generated new Secret key and saved to ./secret: {expected_secret}")
+    else:
+        expected_secret = "dev-secret-12345678900abcdef"
+
+    if secret != expected_secret:
+        print("Unauthorized connection attempt with invalid secret")
+        return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized")
+
+    return None  # continue the WebSocket handshake
+
+
+# ── Startup ────────────────────────────────────────────────────────────────
+async def main():
+    global RENDER_QUEUE
+    RENDER_QUEUE = asyncio.Queue()
+
+    ssl_context = None
+    try:
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(certfile="cert.pem", keyfile="key.pem")
+        print("SSL context created with cert.pem and key.pem")
+    except Exception as e:
+        print(f"Failed to create SSL context: {e}")
+        print("Run ./create-ssl-keys.sh to generate cert.pem and key.pem first.")
+        sys.exit(1)
+
+    asyncio.create_task(_render_worker())
+    asyncio.create_task(_cleanup_task())
+
+    server = await websockets.serve(
+        handle_client, HOST, PORT,
+        process_request=process_request,
+        ssl=ssl_context,
+        max_size=MAX_UPLOAD_BYTES + 4096,  # cap incoming frame size (uploads + small headroom)
+    )
+    print(f"Vocalizer server listening on wss://{HOST}:{PORT}/")
+    await server.serve_forever()
+
+
+if __name__ == "__main__":
+    if not DEV:
+        try:
+            with open("./secret", "r"):
+                print("Using Secret key from ./secret for authentication.")
+        except Exception:
+            print("No existing secret key found. A new one will be generated and saved to ./secret.")
+            new_secret = secrets.token_hex(64)
+            with open("./secret", "w") as f:
+                f.write(new_secret)
+            print(f"Generated new Secret key and saved to ./secret: {new_secret}")
+
+    print("DEV mode:", DEV)
+    print(f"Loading model {MODEL_ID}...")
+    VOCALIZER = Vocalizer(VocalizerConfig(
+        voxcpm_model_id=MODEL_ID,
+        output_sample_rate=SAMPLE_RATE,
+    ))
+    print("Model loaded.")
+    asyncio.run(main())

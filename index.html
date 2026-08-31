@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Vocalizer Server</title>
+<style>
+  body {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #111;
+    color: #ddd;
+    margin: 0;
+    padding: 2em;
+    line-height: 1.5;
+  }
+  h1 { color: #6cf; margin-top: 0; }
+  table { border-collapse: collapse; margin-top: 1em; }
+  th, td { padding: 0.4em 1em; border-bottom: 1px solid #333; text-align: left; vertical-align: top; }
+  th { color: #999; font-weight: normal; }
+  .ok    { color: #6f6; }
+  .warn  { color: #fc6; }
+  .muted { color: #888; }
+  code   { color: #fc6; }
+  .hint  { margin-top: 2em; padding: 1em; background: #1a1a1a; border-left: 3px solid #6cf; }
+  pre    { background: #1a1a1a; padding: 1em; overflow-x: auto; border-left: 3px solid #333; }
+</style>
+</head>
+<body>
+<h1>Vocalizer Server</h1>
+<p class="muted">This endpoint speaks WebSocket. Connect a client over <code>{{PROTOCOL}}://&lt;host&gt;:{{PORT}}/?secret=…</code></p>
+
+<table>
+  <tr><th>Status</th>              <td class="ok">running</td></tr>
+  <tr><th>Protocol</th>            <td>{{PROTOCOL}}</td></tr>
+  <tr><th>Port</th>                <td>{{PORT}}</td></tr>
+  <tr><th>Mode</th>                <td>{{DEV_MODE}}</td></tr>
+  <tr><th>SSL</th>                 <td>{{SSL_MODE}}</td></tr>
+  <tr><th>Model loaded</th>        <td>{{MODEL_LOADED}}</td></tr>
+  <tr><th>Model id</th>            <td>{{MODEL_ID}}</td></tr>
+  <tr><th>Sample rate</th>         <td>{{SAMPLE_RATE}} Hz</td></tr>
+  <tr><th>Output formats</th>      <td>{{OUTPUT_FORMATS}}</td></tr>
+  <tr><th>Max upload size</th>     <td>{{MAX_UPLOAD}}</td></tr>
+  <tr><th>Per-session quota</th>   <td>{{MAX_DIR}}</td></tr>
+  <tr><th>Active sessions</th>     <td>{{ACTIVE_SESSIONS}}</td></tr>
+  <tr><th>Render queue</th>        <td>{{QUEUE_LEN}} pending</td></tr>
+  <tr><th>Uptime</th>              <td>{{UPTIME}}</td></tr>
+</table>
+
+<div class="hint">
+  <strong>Protocol overview</strong>
+  <pre>// Upload a referenced audio file (WAV / MP3 / OGG, &lt; 1 MB)
+-&gt; { "action": "upload_audio", "rid": "1", "filename": "rain.wav", "hash": "&lt;sha256&gt;" }
+&lt;- { "type": "upload_audio_proceed", "rid": "1", "filename": "rain.wav" }   // then send the raw bytes as ONE binary frame
+&lt;- { "type": "upload_audio_skip",    "rid": "1", "filename": "rain.wav" }   // already present, do not send
+&lt;- { "type": "upload_audio_done",    "rid": "1", "filename": "rain.wav" }
+
+// Render a scene; files referenced in the JSON resolve to your uploaded files
+-&gt; { "action": "render_json", "rid": "2", "output_format": "ogg", "payload": { ...scene... } }
+&lt;- { "type": "render_start", "rid": "2", "format": "ogg" }
+&lt;- &lt;binary chunks&gt;
+&lt;- { "type": "render_done",  "rid": "2", "bytes": 12345 }</pre>
+</div>
+
+<div class="hint">
+  If you reached this page through a self-signed certificate warning and clicked
+  <em>“Proceed anyway”</em>, the browser will now also accept
+  <code>wss://</code> connections to this same host:port from your client app.
+</div>
+</body>
+</html>
