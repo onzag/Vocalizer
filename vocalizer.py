@@ -1,6 +1,7 @@
 import glob
 import os
 import random
+import tempfile
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -238,6 +239,21 @@ def render_background_track(background_cfg: dict, markers: list, offsets: list,
     return out
 
 
+def _ensure_wav(path: Optional[str]) -> tuple:
+    """Return (path_to_use, is_temp_file). If the file is not WAV, decode it
+    with soundfile and write a temporary WAV so callers that require WAV input
+    can use it. The caller is responsible for deleting the temp file."""
+    if path is None:
+        return None, False
+    if path.lower().endswith('.wav'):
+        return path, False
+    data, sr = sf.read(path, dtype='float32', always_2d=False)
+    tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+    tmp.close()
+    sf.write(tmp.name, data, sr)
+    return tmp.name, True
+
+
 # --------------------------------------------------------------------------
 # Sound library resolution: "moan-{n}.wav" -> [moan-1.wav, moan-2.wav, ...]
 # --------------------------------------------------------------------------
@@ -304,13 +320,26 @@ class Vocalizer:
         prompt_wav_path = self.library.path_for(prompt_ref) if prompt_ref else None
         prompt_text = segment.get("prompt_text") if prompt_ref else None
 
-        wav = self.model.generate(
-            text=text,
-            reference_wav_path=ref_path,
-            prompt_wav_path=prompt_wav_path,
-            prompt_text=prompt_text,
-            **gen_params,
-        )
+        actual_ref_path, ref_is_temp = _ensure_wav(ref_path)
+        actual_prompt_path, prompt_is_temp = _ensure_wav(prompt_wav_path)
+        temp_files = [p for p, t in ((actual_ref_path, ref_is_temp), (actual_prompt_path, prompt_is_temp)) if t]
+
+        print(f"Generating speech: text='{text}', ref='{actual_ref_path}', prompt_ref='{actual_prompt_path}', prompt_text='{prompt_text}', params={gen_params}")
+        try:
+            wav = self.model.generate(
+                text=text,
+                reference_wav_path=actual_ref_path,
+                prompt_wav_path=actual_prompt_path,
+                prompt_text=prompt_text,
+                **gen_params,
+            )
+        finally:
+            for tmp in temp_files:
+                try:
+                    os.unlink(tmp)
+                    pass
+                except OSError:
+                    pass
         sr = self.model.tts_model.sample_rate
         wav = _ensure_stereo_shape(_to_float32(np.asarray(wav)))
         if sr != self.config.output_sample_rate:
