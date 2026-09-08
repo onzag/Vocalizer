@@ -31,6 +31,8 @@ import ssl
 import sys
 import tempfile
 import time
+import traceback
+from concurrent.futures import ProcessPoolExecutor, BrokenExecutor
 from email.utils import formatdate
 from http import HTTPStatus
 from urllib.parse import urlparse, parse_qs
@@ -55,7 +57,11 @@ FILE_TTL_SECONDS = 30 * 60                # evict files unused for 30 minutes
 CLEANUP_INTERVAL_SECONDS = 60             # how often the janitor task runs
 STREAM_CHUNK_BYTES = 64 * 1024            # size of binary frames sent to client
 
-SUPPORTED_OUTPUT_FORMATS = {"ogg": "OGG", "mp3": "MP3"}
+# NOTE: OGG/Vorbis output is disabled. The bundled libsndfile (1.2.2) crashes
+# natively when encoding OGG buffers longer than ~a few seconds, so all output
+# is forced to MP3. Requests asking for "ogg" are transparently served as MP3.
+SUPPORTED_OUTPUT_FORMATS = {"mp3": "MP3"}
+DEFAULT_OUTPUT_FORMAT = "mp3"
 
 MODEL_ID = os.getenv("VOCALIZER_MODEL_ID", "openbmb/VoxCPM2")
 SAMPLE_RATE = int(os.getenv("VOCALIZER_SAMPLE_RATE", "48000"))
@@ -67,6 +73,12 @@ VOCALIZER: Vocalizer = None  # set in main()
 
 # FIFO render queue shared by every client.
 RENDER_QUEUE: "asyncio.Queue" = None  # created inside main()
+
+# Dedicated single-worker process pool used only for audio encoding. Encoding
+# runs libsndfile (a native library) which can, on rare malformed buffers,
+# crash at the C level. Isolating it in a child process means such a crash
+# raises BrokenProcessPool here instead of taking the whole server down.
+_ENCODE_POOL: "ProcessPoolExecutor" = None  # created lazily
 
 # Registry of active connections, used by the cleanup janitor.
 ACTIVE_CONNECTIONS = set()
@@ -223,12 +235,85 @@ class Session:
 
 
 # ── Rendering ──────────────────────────────────────────────────────────────
-def _encode_audio(audio: np.ndarray, output_format: str) -> bytes:
-    """Encode a rendered audio array to the requested container as bytes."""
+def _sanitize_audio(audio: "np.ndarray", sample_rate: int) -> "np.ndarray":
+    """Coerce a rendered audio buffer into something libsndfile can always
+    encode safely: finite float32 samples clamped to [-1, 1].
+
+    Malformed model output (NaN/Inf, or samples far outside [-1, 1]) is the
+    usual trigger for a native Vorbis-encoder crash, so we scrub it here before
+    the buffer ever reaches the encoder.
+    """
+    arr = np.asarray(audio)
+    if arr.dtype != np.float32:
+        arr = arr.astype(np.float32)
+    # Replace NaN -> 0 and +/-Inf -> +/-1.0.
+    arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
+    # Clamp anything still out of range.
+    np.clip(arr, -1.0, 1.0, out=arr)
+    # Guarantee a contiguous 2D buffer.
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    return np.ascontiguousarray(arr)
+
+
+def _encode_audio_worker(audio: "np.ndarray", sf_format: str, sample_rate: int) -> bytes:
+    """Runs inside the encode subprocess. Writes to a real temp file (rather
+    than BytesIO) so libsndfile's virtual-IO layer is never involved for
+    seek-heavy formats like OGG Vorbis."""
+    suffix = ".ogg" if sf_format == "OGG" else ".mp3"
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    try:
+        os.close(tmp_fd)
+        sf.write(tmp_path, audio, sample_rate, format=sf_format)
+        with open(tmp_path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _get_encode_pool() -> "ProcessPoolExecutor":
+    """Return the shared encode pool, (re)creating it if missing or broken."""
+    global _ENCODE_POOL
+    if _ENCODE_POOL is None:
+        _ENCODE_POOL = ProcessPoolExecutor(max_workers=1)
+    return _ENCODE_POOL
+
+
+def _reset_encode_pool():
+    """Tear down a broken encode pool so the next render gets a fresh one."""
+    global _ENCODE_POOL
+    pool = _ENCODE_POOL
+    _ENCODE_POOL = None
+    if pool is not None:
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+
+async def _encode_audio(audio: "np.ndarray", output_format: str) -> bytes:
+    """Sanitize and encode a rendered audio array in an isolated subprocess.
+
+    A native crash in the encoder surfaces here as BrokenExecutor/OSError, which
+    the render worker turns into a normal error response — the main server
+    process keeps running.
+    """
     sf_format = SUPPORTED_OUTPUT_FORMATS[output_format]
-    buffer = io.BytesIO()
-    sf.write(buffer, audio, VOCALIZER.config.output_sample_rate, format=sf_format)
-    return buffer.getvalue()
+    sample_rate = VOCALIZER.config.output_sample_rate
+    safe = _sanitize_audio(audio, sample_rate)
+
+    loop = asyncio.get_running_loop()
+    pool = _get_encode_pool()
+    try:
+        return await loop.run_in_executor(pool, _encode_audio_worker, safe, sf_format, sample_rate)
+    except (BrokenExecutor, OSError) as e:
+        # The encode subprocess died (likely a native crash). Recycle the pool
+        # and report a clean failure instead of crashing the server.
+        _reset_encode_pool()
+        raise RuntimeError(f"Audio encoding failed (encoder subprocess crashed): {e}") from e
 
 
 def _render_blocking(payload: dict, session_dir: str) -> np.ndarray:
@@ -240,10 +325,21 @@ def _render_blocking(payload: dict, session_dir: str) -> np.ndarray:
 
 
 async def _render_worker():
-    """Single consumer of RENDER_QUEUE. Guarantees FIFO, one render at a time."""
-    loop = asyncio.get_event_loop()
+    """Single consumer of RENDER_QUEUE. Guarantees FIFO, one render at a time.
+
+    Wrapped in an outer restart loop so that any unhandled BaseException (e.g.
+    an unexpected native crash propagated via run_in_executor) is printed and
+    the worker restarts immediately rather than silently dying.
+    """
+    loop = asyncio.get_running_loop()
     while True:
-        job = await RENDER_QUEUE.get()
+        job = None
+        try:
+            job = await RENDER_QUEUE.get()
+        except asyncio.CancelledError:
+            print("[render_worker] cancelled — stopping.")
+            return
+
         websocket = job["websocket"]
         rid = job["rid"]
         payload = job["payload"]
@@ -252,22 +348,41 @@ async def _render_worker():
         future = job["future"]
         try:
             session.touch_all()
+            print(f"[render] {rid}: start (format={output_format}) from {websocket.remote_address}")
+            print(f"[render] {rid}: payload={payload}")
+
+            print(f"[render] {rid}: generating audio…")
             audio = await loop.run_in_executor(None, _render_blocking, payload, session.dir)
-            data = await loop.run_in_executor(None, _encode_audio, audio, output_format)
+            print(f"[render] {rid}: generation done, shape={audio.shape} — encoding to {output_format}…")
+
+            data = await _encode_audio(audio, output_format)
+            print(f"[render] {rid}: encoded {len(data):,} bytes — streaming to client…")
 
             await websocket.send(_json({"type": "render_start", "rid": rid, "format": output_format}))
             for i in range(0, len(data), STREAM_CHUNK_BYTES):
                 await websocket.send(data[i:i + STREAM_CHUNK_BYTES])
             await websocket.send(_json({"type": "render_done", "rid": rid, "bytes": len(data)}))
+            print(f"[render] {rid}: done.")
             if not future.done():
                 future.set_result(True)
         except Exception as e:
+            print(f"[render] {rid}: ERROR — {e}")
+            traceback.print_exc()
             try:
                 await websocket.send(_json({"type": "error", "rid": rid, "message": str(e)}))
             except Exception:
                 pass
             if not future.done():
                 future.set_result(False)
+        except BaseException as e:
+            # CancelledError, KeyboardInterrupt, or a native crash re-raised from
+            # run_in_executor.  Log it, unblock the caller, then re-raise.
+            # (finally: RENDER_QUEUE.task_done() still runs after the raise.)
+            print(f"[render] {rid}: FATAL {type(e).__name__}: {e}")
+            traceback.print_exc()
+            if not future.done():
+                future.set_result(False)
+            raise
         finally:
             RENDER_QUEUE.task_done()
 
@@ -379,14 +494,14 @@ async def _handle_render_request(websocket, session: Session, data: dict, rid: s
     payload = data.get("payload")
     if not payload:
         raise ValueError("render_json requires a 'payload'")
-    output_format = (data.get("output_format") or "ogg").lower()
+    output_format = (data.get("output_format") or DEFAULT_OUTPUT_FORMAT).lower()
     if output_format not in SUPPORTED_OUTPUT_FORMATS:
-        raise ValueError(
-            f"Unsupported output_format '{output_format}' "
-            f"(supported: {', '.join(SUPPORTED_OUTPUT_FORMATS.keys())})"
-        )
+        # OGG (and anything else) is not supported by this build; fall back to
+        # MP3 rather than failing the request.
+        print(f"[render] {rid}: output_format '{output_format}' unsupported — using {DEFAULT_OUTPUT_FORMAT}")
+        output_format = DEFAULT_OUTPUT_FORMAT
 
-    future = asyncio.get_event_loop().create_future()
+    future = asyncio.get_running_loop().create_future()
     position = RENDER_QUEUE.qsize()
     await RENDER_QUEUE.put({
         "websocket": websocket,
@@ -475,6 +590,17 @@ async def main():
 
     asyncio.create_task(_render_worker())
     asyncio.create_task(_cleanup_task())
+
+    # Pre-warm the isolated encode pool so the (Windows spawn) startup cost is
+    # paid now rather than on the first client render.
+    try:
+        loop = asyncio.get_running_loop()
+        pool = _get_encode_pool()
+        warm = _sanitize_audio(np.zeros((1, 2), dtype=np.float32), SAMPLE_RATE)
+        await loop.run_in_executor(pool, _encode_audio_worker, warm, "MP3", SAMPLE_RATE)
+        print("Encode subprocess pool ready.")
+    except Exception as e:
+        print(f"Warning: failed to pre-warm encode pool: {e}")
 
     server = await websockets.serve(
         handle_client, HOST, PORT,
