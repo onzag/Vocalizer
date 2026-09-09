@@ -176,6 +176,17 @@ The server will respond with a model_loaded message when the model has been load
 }
 ```
 
+## model_unloaded
+
+The server will respond with a model_unloaded message when the model has been unloaded from memory.
+
+```json
+{
+  "type": "model_unloaded",
+  "rid": "request_id"
+}
+```
+
 ## Special actions (only available if `ENABLE_UNLOAD` is set to 1)
 
 ### unload_model
@@ -191,7 +202,7 @@ Unloads the model from memory.
 
 ## load_model
 
-Reloads the model into memory, normally this is not necessary to run as the action as render_json will automatically load the model.
+Reloads the model into memory. While the model is unloaded, `render_json` returns an error until this action completes.
 
 ```json
 {

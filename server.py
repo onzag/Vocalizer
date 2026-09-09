@@ -21,6 +21,7 @@
 # (GPU-bound) model is only ever running one render at a time.
 
 import asyncio
+import gc
 import hashlib
 import io
 import json as _json_mod
@@ -50,6 +51,7 @@ PORT = int(os.getenv("PORT", "8222"))
 HOST = os.getenv("HOST", "0.0.0.0")
 
 DEV = os.getenv("DEV", "0") == "1"
+ENABLE_UNLOAD = os.getenv("ENABLE_UNLOAD", "0") == "1"
 
 MAX_UPLOAD_BYTES = 1 * 1024 * 1024        # 1 MB hard cap per uploaded file
 MAX_DIR_BYTES = 100 * 1024 * 1024         # 100 MB per-connection quota
@@ -68,8 +70,13 @@ SAMPLE_RATE = int(os.getenv("VOCALIZER_SAMPLE_RATE", "48000"))
 
 SERVER_START_TIME = time.time()
 
-# The single shared Vocalizer instance (model loaded once).
+# The shared Vocalizer instance (None while loading is deferred or unloaded).
 VOCALIZER: Vocalizer = None  # set in main()
+
+# Serializes model loading, unloading, and generation. Encoding doesn't use
+# the model and happens outside this lock, allowing unload to release model
+# memory as soon as generation finishes.
+MODEL_LOCK: "asyncio.Lock" = None  # created inside main()
 
 # FIFO render queue shared by every client.
 RENDER_QUEUE: "asyncio.Queue" = None  # created inside main()
@@ -302,13 +309,12 @@ async def _encode_audio(audio: "np.ndarray", output_format: str) -> bytes:
     process keeps running.
     """
     sf_format = SUPPORTED_OUTPUT_FORMATS[output_format]
-    sample_rate = VOCALIZER.config.output_sample_rate
-    safe = _sanitize_audio(audio, sample_rate)
+    safe = _sanitize_audio(audio, SAMPLE_RATE)
 
     loop = asyncio.get_running_loop()
     pool = _get_encode_pool()
     try:
-        return await loop.run_in_executor(pool, _encode_audio_worker, safe, sf_format, sample_rate)
+        return await loop.run_in_executor(pool, _encode_audio_worker, safe, sf_format, SAMPLE_RATE)
     except (BrokenExecutor, OSError) as e:
         # The encode subprocess died (likely a native crash). Recycle the pool
         # and report a clean failure instead of crashing the server.
@@ -316,12 +322,37 @@ async def _encode_audio(audio: "np.ndarray", output_format: str) -> bytes:
         raise RuntimeError(f"Audio encoding failed (encoder subprocess crashed): {e}") from e
 
 
-def _render_blocking(payload: dict, session_dir: str) -> np.ndarray:
+def _render_blocking(vocalizer: Vocalizer, payload: dict, session_dir: str) -> np.ndarray:
     """Runs on an executor thread. Points the shared Vocalizer's library at the
     connection's temp dir so file/ref references resolve to uploaded files."""
-    VOCALIZER.library = SoundLibrary(session_dir)
-    VOCALIZER.config.sound_library_dir = session_dir
-    return VOCALIZER.render_json(payload)
+    vocalizer.library = SoundLibrary(session_dir)
+    vocalizer.config.sound_library_dir = session_dir
+    return vocalizer.render_json(payload)
+
+
+def _create_vocalizer() -> Vocalizer:
+    """Construct and load a fresh Vocalizer model."""
+    return Vocalizer(VocalizerConfig(
+        voxcpm_model_id=MODEL_ID,
+        output_sample_rate=SAMPLE_RATE,
+    ))
+
+
+def _release_vocalizer(vocalizer: Vocalizer):
+    """Release model references and return cached accelerator memory."""
+    # The awaiting coroutine retains the lightweight Vocalizer wrapper until
+    # this function returns, so detach the heavyweight model explicitly before
+    # collecting objects and clearing the allocator cache.
+    vocalizer.model = None
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        # CPU-only installations and partially initialized CUDA runtimes don't
+        # need any additional cleanup.
+        pass
 
 
 async def _render_worker():
@@ -352,7 +383,15 @@ async def _render_worker():
             print(f"[render] {rid}: payload={payload}")
 
             print(f"[render] {rid}: generating audio…")
-            audio = await loop.run_in_executor(None, _render_blocking, payload, session.dir)
+            async with MODEL_LOCK:
+                vocalizer = VOCALIZER
+                if vocalizer is None:
+                    raise RuntimeError(
+                        "Vocalizer model is unloaded; call load_model before rendering"
+                    )
+                audio = await loop.run_in_executor(
+                    None, _render_blocking, vocalizer, payload, session.dir,
+                )
             print(f"[render] {rid}: generation done, shape={audio.shape} — encoding to {output_format}…")
 
             data = await _encode_audio(audio, output_format)
@@ -404,8 +443,10 @@ async def handle_client(websocket):
         "max_upload_bytes": MAX_UPLOAD_BYTES,
         "max_session_bytes": MAX_DIR_BYTES,
         "file_ttl_seconds": FILE_TTL_SECONDS,
-        "sample_rate": VOCALIZER.config.output_sample_rate,
+        "sample_rate": SAMPLE_RATE,
         "supports_parallel_requests": False,
+        "supports_model_unload": ENABLE_UNLOAD,
+        "model_loaded": VOCALIZER is not None,
     }))
 
     try:
@@ -426,6 +467,10 @@ async def handle_client(websocket):
                     await _handle_upload_request(websocket, session, data, rid)
                 elif action == "render_json":
                     await _handle_render_request(websocket, session, data, rid)
+                elif action == "load_model":
+                    await _handle_load_model(websocket, rid)
+                elif action == "unload_model":
+                    await _handle_unload_model(websocket, rid)
                 elif action == "ping":
                     await websocket.send(_json({"type": "pong", "rid": rid}))
                 else:
@@ -491,6 +536,11 @@ async def _handle_binary(websocket, session: Session, data: bytes):
 
 
 async def _handle_render_request(websocket, session: Session, data: dict, rid: str):
+    if VOCALIZER is None:
+        raise RuntimeError(
+            "Vocalizer model is unloaded; call load_model before rendering"
+        )
+
     payload = data.get("payload")
     if not payload:
         raise ValueError("render_json requires a 'payload'")
@@ -514,6 +564,45 @@ async def _handle_render_request(websocket, session: Session, data: dict, rid: s
     await websocket.send(_json({"type": "queued", "rid": rid, "position": position}))
     # Wait for this job to finish so we don't interleave two renders on one socket.
     await future
+
+
+def _require_unload_enabled(action: str):
+    if not ENABLE_UNLOAD:
+        raise RuntimeError(
+            f"{action} is disabled; start the server with ENABLE_UNLOAD=1"
+        )
+
+
+async def _handle_load_model(websocket, rid: str):
+    """Load the shared model, treating an already-loaded model as success."""
+    global VOCALIZER
+    _require_unload_enabled("load_model")
+
+    async with MODEL_LOCK:
+        if VOCALIZER is None:
+            print(f"[model] {rid}: loading {MODEL_ID}...")
+            loop = asyncio.get_running_loop()
+            VOCALIZER = await loop.run_in_executor(None, _create_vocalizer)
+            print(f"[model] {rid}: loaded.")
+
+    await websocket.send(_json({"type": "model_loaded", "rid": rid}))
+
+
+async def _handle_unload_model(websocket, rid: str):
+    """Unload the shared model after any active generation has completed."""
+    global VOCALIZER
+    _require_unload_enabled("unload_model")
+
+    async with MODEL_LOCK:
+        vocalizer = VOCALIZER
+        VOCALIZER = None
+        if vocalizer is not None:
+            print(f"[model] {rid}: unloading...")
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _release_vocalizer, vocalizer)
+            print(f"[model] {rid}: unloaded.")
+
+    await websocket.send(_json({"type": "model_unloaded", "rid": rid}))
 
 
 # ── Background janitor ─────────────────────────────────────────────────────
@@ -575,8 +664,16 @@ async def process_request(connection, request):
 
 # ── Startup ────────────────────────────────────────────────────────────────
 async def main():
-    global RENDER_QUEUE
+    global MODEL_LOCK, RENDER_QUEUE, VOCALIZER
+    MODEL_LOCK = asyncio.Lock()
     RENDER_QUEUE = asyncio.Queue()
+
+    if ENABLE_UNLOAD:
+        print("Model loading deferred because ENABLE_UNLOAD=1.")
+    else:
+        print(f"Loading model {MODEL_ID}...")
+        VOCALIZER = _create_vocalizer()
+        print("Model loaded.")
 
     ssl_context = None
     try:
@@ -625,10 +722,5 @@ if __name__ == "__main__":
             print(f"Generated new Secret key and saved to ./secret: {new_secret}")
 
     print("DEV mode:", DEV)
-    print(f"Loading model {MODEL_ID}...")
-    VOCALIZER = Vocalizer(VocalizerConfig(
-        voxcpm_model_id=MODEL_ID,
-        output_sample_rate=SAMPLE_RATE,
-    ))
-    print("Model loaded.")
+    print("ENABLE_UNLOAD:", ENABLE_UNLOAD)
     asyncio.run(main())
