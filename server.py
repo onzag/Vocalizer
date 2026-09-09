@@ -46,8 +46,8 @@ from websockets.datastructures import Headers
 from vocalizer import Vocalizer, VocalizerConfig, SoundLibrary
 
 # ── Configuration ─────────────────────────────────────────────────────────
-PORT = 8222
-HOST = "0.0.0.0"
+PORT = int(os.getenv("PORT", "8222"))
+HOST = os.getenv("HOST", "0.0.0.0")
 
 DEV = os.getenv("DEV", "0") == "1"
 
