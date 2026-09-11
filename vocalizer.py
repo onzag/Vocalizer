@@ -8,10 +8,8 @@ from typing import Optional, Union
 import numpy as np
 import soundfile as sf
 
-
 DEFAULT_VOXCPM_MODEL_ID = "openbmb/VoxCPM2"
 DEFAULT_FISH_AUDIO_S2_MODEL_ID = "checkpoints/s2-pro"
-
 
 # --------------------------------------------------------------------------
 # Config
@@ -21,9 +19,6 @@ DEFAULT_FISH_AUDIO_S2_MODEL_ID = "checkpoints/s2-pro"
 class VocalizerConfig:
     sound_library_dir: str = "./sounds"
     output_sample_rate: int = 48000
-    # voxcpm_model_id remains as a compatibility alias for existing callers
-    # (main.py/server.py). New code should use backend-neutral model_id.
-    voxcpm_model_id: Optional[str] = DEFAULT_VOXCPM_MODEL_ID
     load_denoiser: bool = False
     cfg_value: float = 2.0
     inference_timesteps: int = 10
