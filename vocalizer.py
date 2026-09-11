@@ -8,10 +8,9 @@ from typing import Optional, Union
 import numpy as np
 import soundfile as sf
 
-try:
-    from voxcpm import VoxCPM
-except ImportError:
-    VoxCPM = None
+
+DEFAULT_VOXCPM_MODEL_ID = "openbmb/VoxCPM2"
+DEFAULT_FISH_AUDIO_S2_MODEL_ID = "checkpoints/s2-pro"
 
 
 # --------------------------------------------------------------------------
@@ -22,12 +21,25 @@ except ImportError:
 class VocalizerConfig:
     sound_library_dir: str = "./sounds"
     output_sample_rate: int = 48000
-    voxcpm_model_id: str = "openbmb/VoxCPM2"
+    # voxcpm_model_id remains as a compatibility alias for existing callers
+    # (main.py/server.py). New code should use backend-neutral model_id.
+    voxcpm_model_id: Optional[str] = DEFAULT_VOXCPM_MODEL_ID
     load_denoiser: bool = False
     cfg_value: float = 2.0
     inference_timesteps: int = 10
     crossfade_ms: int = 15
     target_loudness_db: float = -20.0   # RMS target every clip is normalized to before volume gain
+    model_id: Optional[str] = None
+    fish_decoder_checkpoint_path: Optional[str] = None
+    fish_decoder_config_name: str = "modded_dac_vq"
+    fish_device: Optional[str] = None
+    fish_half: bool = False
+    fish_compile: bool = False
+    fish_max_new_tokens: int = 1024
+    fish_chunk_length: int = 200
+    fish_top_p: float = 0.8
+    fish_repetition_penalty: float = 1.1
+    fish_temperature: float = 0.8
 
 
 # --------------------------------------------------------------------------
@@ -296,18 +308,159 @@ class Vocalizer:
         self.config = config
         self.library = SoundLibrary(config.sound_library_dir)
         self.model = None
-        if VoxCPM is not None:
-            self.model = VoxCPM.from_pretrained(config.voxcpm_model_id, load_denoiser=config.load_denoiser)
+        self.backend = self._resolve_backend()
+        self.model_id = self._resolve_model_id()
+        self._fish_types = None
+
+        if self.backend == "voxcpm":
+            self._load_voxcpm()
+        else:
+            self._load_fish_audio_s2()
+
+    @staticmethod
+    def _resolve_backend() -> str:
+        raw_backend = os.getenv("VOCALIZER_MODE", os.getenv("VOCALIZER_BACKEND", "voxcpm"))
+        backend = raw_backend.strip().lower().replace("-", "_")
+        aliases = {
+            "voxcpm": "voxcpm",
+            "vox_cpm": "voxcpm",
+            "fish": "fish_audio_s2",
+            "fish_speech": "fish_audio_s2",
+            "fish_audio": "fish_audio_s2",
+            "fish_audio_s2": "fish_audio_s2",
+            "s2": "fish_audio_s2",
+        }
+        try:
+            return aliases[backend]
+        except KeyError as exc:
+            choices = "voxcpm or fish_audio_s2"
+            raise ValueError(f"Unsupported VOCALIZER_MODE {raw_backend!r}; expected {choices}") from exc
+
+    def _resolve_model_id(self) -> str:
+        if self.config.model_id:
+            return self.config.model_id
+
+        env_model_id = os.getenv("VOCALIZER_MODEL_ID")
+        if env_model_id:
+            return env_model_id
+
+        legacy_model_id = self.config.voxcpm_model_id
+        if legacy_model_id:
+            # server.py and main.py currently pass their VoxCPM default through
+            # the legacy field. Do not accidentally use it as an S2 checkpoint.
+            if self.backend == "voxcpm" or legacy_model_id != DEFAULT_VOXCPM_MODEL_ID:
+                return legacy_model_id
+
+        if self.backend == "voxcpm":
+            return DEFAULT_VOXCPM_MODEL_ID
+        return DEFAULT_FISH_AUDIO_S2_MODEL_ID
+
+    def _load_voxcpm(self):
+        try:
+            from voxcpm import VoxCPM
+        except ImportError:
+            VoxCPM = None
+        
+        if VoxCPM is None:
+            raise ImportError(
+                "VoxCPM mode requires the 'voxcpm' package. "
+                "Set VOCALIZER_MODE=fish_audio_s2 only when Fish Speech is installed."
+            )
+        self.model = VoxCPM.from_pretrained(
+            self.model_id,
+            load_denoiser=self.config.load_denoiser,
+        )
+
+    def _load_fish_audio_s2(self):
+        try:
+            import torch
+            from fish_speech.inference_engine import TTSInferenceEngine
+            from fish_speech.models.dac.inference import load_model as load_decoder_model
+            from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
+            from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest
+        except ImportError as exc:
+            raise ImportError(
+                "Fish Audio S2 mode requires a local Fish Speech installation "
+                "(the 'fish_speech' package); no API server is used."
+            ) from exc
+
+        checkpoint_path = os.path.abspath(os.path.expanduser(self.model_id))
+        decoder_checkpoint_path = self.config.fish_decoder_checkpoint_path
+        if decoder_checkpoint_path is None:
+            decoder_checkpoint_path = os.path.join(checkpoint_path, "codec.pth")
+        else:
+            decoder_checkpoint_path = os.path.abspath(os.path.expanduser(decoder_checkpoint_path))
+
+        if not os.path.isdir(checkpoint_path):
+            raise FileNotFoundError(
+                f"Fish Audio S2 checkpoint directory not found: {checkpoint_path}. "
+                "Download fishaudio/s2-pro locally and set VOCALIZER_MODEL_ID "
+                "or VocalizerConfig.model_id to that directory."
+            )
+        if not os.path.isfile(decoder_checkpoint_path):
+            raise FileNotFoundError(
+                f"Fish Audio S2 codec checkpoint not found: {decoder_checkpoint_path}"
+            )
+
+        device = self.config.fish_device
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif getattr(torch, "xpu", None) is not None and torch.xpu.is_available():
+                device = "xpu"
+            elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+
+        precision = torch.float16 if self.config.fish_half else torch.bfloat16
+        llama_queue = launch_thread_safe_queue(
+            checkpoint_path=checkpoint_path,
+            device=device,
+            precision=precision,
+            compile=self.config.fish_compile,
+        )
+        decoder_model = load_decoder_model(
+            config_name=self.config.fish_decoder_config_name,
+            checkpoint_path=decoder_checkpoint_path,
+            device=device,
+        )
+        self.model = TTSInferenceEngine(
+            llama_queue=llama_queue,
+            decoder_model=decoder_model,
+            precision=precision,
+            compile=self.config.fish_compile,
+        )
+        self._fish_types = (ServeReferenceAudio, ServeTTSRequest)
 
     def _resolve_generation_params(self, segment: dict, script_generation: dict) -> dict:
-        params = {"cfg_value": self.config.cfg_value, "inference_timesteps": self.config.inference_timesteps}
-        params.update(script_generation or {})
-        for key in ("cfg_value", "inference_timesteps", "normalize", "denoise", "seed"):
+        if self.backend == "voxcpm":
+            params = {"cfg_value": self.config.cfg_value, "inference_timesteps": self.config.inference_timesteps}
+            params.update(script_generation or {})
+            allowed = ("cfg_value", "inference_timesteps", "normalize", "denoise", "seed")
+        else:
+            params = {
+                "max_new_tokens": self.config.fish_max_new_tokens,
+                "chunk_length": self.config.fish_chunk_length,
+                "top_p": self.config.fish_top_p,
+                "repetition_penalty": self.config.fish_repetition_penalty,
+                "temperature": self.config.fish_temperature,
+            }
+            allowed = (
+                "max_new_tokens", "chunk_length", "top_p",
+                "repetition_penalty", "temperature", "normalize", "seed",
+            )
+        for key in allowed:
+            if key in (script_generation or {}):
+                params[key] = script_generation[key]
             if key in segment:
                 params[key] = segment[key]
         return params
 
     def _render_speech(self, segment: dict, script_generation: dict) -> np.ndarray:
+        if self.backend == "fish_audio_s2":
+            return self._render_fish_speech(segment, script_generation)
+
         ref = segment.get("ref")
         text = segment["text"]
         voice_prompt = segment.get("voice_prompt")
@@ -349,6 +502,76 @@ class Vocalizer:
         wav = normalize_rms(wav, self.config.target_loudness_db)
         wav = wav * resolve_volume_spec(segment.get("volume"))
         return wav
+
+    def _render_fish_speech(self, segment: dict, script_generation: dict) -> np.ndarray:
+        ServeReferenceAudio, ServeTTSRequest = self._fish_types
+
+        text = segment["text"]
+        voice_prompt = segment.get("voice_prompt")
+        if voice_prompt:
+            # S2 supports natural-language inline control tags.
+            text = f"[{voice_prompt}]{text}"
+
+        # Fish has one reference mechanism. Prefer the API's transcript-aware
+        # prompt_ref path, while accepting ref for compatibility with ordinary
+        # Vocalizer voice-reference segments.
+        reference_name = segment.get("prompt_ref") or segment.get("ref")
+        prompt_text = segment.get("prompt_text")
+        references = []
+        if reference_name:
+            if not prompt_text or not str(prompt_text).strip():
+                raise ValueError(
+                    "Fish Audio S2 requires segment.prompt_text containing the "
+                    "exact transcript whenever ref or prompt_ref is provided."
+                )
+            reference_path = self.library.path_for(reference_name)
+            with open(reference_path, "rb") as audio_file:
+                references.append(
+                    ServeReferenceAudio(audio=audio_file.read(), text=prompt_text)
+                )
+
+        gen_params = self._resolve_generation_params(segment, script_generation)
+        request = ServeTTSRequest(
+            text=text,
+            references=references,
+            reference_id=None,
+            use_memory_cache="on" if references else "off",
+            streaming=False,
+            format="wav",
+            **gen_params,
+        )
+        print(
+            f"Generating speech with Fish Audio S2: text={text!r}, "
+            f"reference={reference_name!r}, params={gen_params}"
+        )
+
+        final_audio = None
+        final_sample_rate = None
+        for result in self.model.inference(request):
+            if result.code == "error":
+                error = result.error
+                if isinstance(error, BaseException):
+                    raise RuntimeError(f"Fish Audio S2 generation failed: {error}") from error
+                raise RuntimeError(f"Fish Audio S2 generation failed: {error}")
+            if result.code == "final":
+                if not isinstance(result.audio, tuple):
+                    raise RuntimeError("Fish Audio S2 returned an invalid final audio result")
+                final_sample_rate, final_audio = result.audio
+
+        if final_audio is None or final_sample_rate is None:
+            raise RuntimeError("Fish Audio S2 did not generate any audio")
+
+        wav = _ensure_stereo_shape(_to_float32(np.asarray(final_audio)))
+        if final_sample_rate != self.config.output_sample_rate:
+            wav = np.stack(
+                [
+                    _resample(wav[:, c], final_sample_rate, self.config.output_sample_rate)
+                    for c in range(wav.shape[1])
+                ],
+                axis=1,
+            )
+        wav = normalize_rms(wav, self.config.target_loudness_db)
+        return wav * resolve_volume_spec(segment.get("volume"))
 
     def _render_library_clip(self, segment: dict) -> np.ndarray:
         pattern = segment["ref"]
