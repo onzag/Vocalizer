@@ -1,7 +1,6 @@
 # Audio assets and generated output — supply your own, don't commit
 *.wav
 *.mp3
-*.flac
 sounds/*
 !sounds/.gitkeep
 !sounds/README.md
@@ -31,3 +30,8 @@ models/
 *.pem
 *.key
 secret
+
+# fishaudio
+
+fish-speech/
+fish-speech-*
