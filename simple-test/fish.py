@@ -10,7 +10,7 @@ import torch
 from fish_speech.inference_engine import TTSInferenceEngine
 from fish_speech.models.dac.inference import load_model as load_decoder_model
 from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
-from fish_speech.utils.schema import ServeTTSRequest
+from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest
 
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -21,6 +21,15 @@ CHECKPOINT_DIR = Path(
     )
 ).expanduser().resolve()
 OUTPUT_PATH = Path(__file__).resolve().parent / "fish-test.wav"
+REFERENCE_PATH = Path(__file__).resolve().parent / "garrison.flac"
+REFERENCE_TRANSCRIPT = (
+    "Choose between the high road and the low, sell your gift to a buyer at a good game, "
+    "try to trace the fine lines of the painting"
+)
+SYNTHESIS_TEXT = (
+    "[excited] Hello world! [laughing] This is Fish Audio S2. "
+    "[sigh] [excited] I cannot believe how expressive this voice can sound!"
+)
 
 
 def pick_device() -> str:
@@ -42,6 +51,8 @@ def main() -> None:
         )
     if not codec_path.is_file():
         raise FileNotFoundError(f"S2 codec checkpoint not found: {codec_path}")
+    if not REFERENCE_PATH.is_file():
+        raise FileNotFoundError(f"Reference voice file not found: {REFERENCE_PATH}")
 
     device = pick_device()
     precision = torch.bfloat16
@@ -66,8 +77,14 @@ def main() -> None:
         )
 
         request = ServeTTSRequest(
-            text="Hello world! This is Fish Audio S2.",
-            references=[],
+            # S2 uses inline natural-language tags for delivery and expressions.
+            text=SYNTHESIS_TEXT,
+            references=[
+                ServeReferenceAudio(
+                    audio=REFERENCE_PATH.read_bytes(),
+                    text=REFERENCE_TRANSCRIPT,
+                )
+            ],
             reference_id=None,
             streaming=False,
             format="wav",

@@ -32,3 +32,5 @@ pip install -e "$FISH_SPEECH_DIR[cu129]"
 # If you encounter an error during installation due to pyaudio, consider using the following command:
 # "$CONDA_CMD" install pyaudio
 # Then run pip install -e "$FISH_SPEECH_DIR" again
+
+pip install -r requirements-fishaudio.txt
