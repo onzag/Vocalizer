@@ -27,8 +27,8 @@ REFERENCE_TRANSCRIPT = (
     "try to trace the fine lines of the painting"
 )
 SYNTHESIS_TEXT = (
-    "[excited] Hello world! [laughing] This is Fish Audio S2. "
-    "[sigh] [excited] I cannot believe how expressive this voice can sound!"
+    "<|speaker:0|>[happy][laughing]What do you mean by that? *ha ha ha*.\n"
+    "<|speaker:0|>[angry][sighing] That so?!... I am [emphasis] very angry right now, *sigh*, I need to calm down."
 )
 
 
@@ -88,6 +88,7 @@ def main() -> None:
             reference_id=None,
             streaming=False,
             format="wav",
+            temperature=1.0
         )
 
         for result in engine.inference(request):

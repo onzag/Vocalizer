@@ -3,6 +3,7 @@ import json
 import os
 import random
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
@@ -370,6 +371,12 @@ class Vocalizer:
         if not isinstance(self.model_id, str) or not self.model_id.strip():
             raise ValueError(f"{self.engine_config_path}: model_id must be a non-empty string")
         self._fish_types = None
+        # Fish Speech keeps its semantic model in a daemon worker thread.  The
+        # queue alone doesn't own that model: the worker's stack does.  Retain
+        # both objects so close() can send Fish's shutdown sentinel and wait
+        # until the thread has actually released its CUDA tensors.
+        self._fish_llama_queue = None
+        self._fish_worker_thread = None
 
         if self.backend == "voxcpm":
             self._load_voxcpm()
@@ -441,24 +448,125 @@ class Vocalizer:
                 device = "cpu"
 
         precision = torch.float16 if self.engine_config["half"] else torch.bfloat16
+        threads_before = set(threading.enumerate())
         llama_queue = launch_thread_safe_queue(
             checkpoint_path=str(checkpoint_path),
             device=device,
             precision=precision,
             compile=self.engine_config["compile"],
         )
-        decoder_model = load_decoder_model(
-            config_name=self.engine_config["decoder_config_name"],
-            checkpoint_path=str(decoder_checkpoint_path),
-            device=device,
+        self._fish_llama_queue = llama_queue
+        self._fish_worker_thread = self._find_fish_worker_thread(
+            llama_queue, threads_before
         )
-        self.model = TTSInferenceEngine(
-            llama_queue=llama_queue,
-            decoder_model=decoder_model,
-            precision=precision,
-            compile=self.engine_config["compile"],
-        )
-        self._fish_types = (ServeReferenceAudio, ServeTTSRequest)
+
+        try:
+            decoder_model = load_decoder_model(
+                config_name=self.engine_config["decoder_config_name"],
+                checkpoint_path=str(decoder_checkpoint_path),
+                device=device,
+            )
+            self.model = TTSInferenceEngine(
+                llama_queue=llama_queue,
+                decoder_model=decoder_model,
+                precision=precision,
+                compile=self.engine_config["compile"],
+            )
+            self._fish_types = (ServeReferenceAudio, ServeTTSRequest)
+        except BaseException:
+            # If decoder loading fails (including CUDA OOM), the semantic
+            # worker has already loaded its model and must still be stopped.
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                print(
+                    "Warning: Fish Speech cleanup after a failed load also "
+                    f"failed: {cleanup_error}"
+                )
+            raise
+
+    @staticmethod
+    def _find_fish_worker_thread(llama_queue, threads_before: set):
+        """Find the daemon thread created by launch_thread_safe_queue().
+
+        Fish returns only its input queue, not the Thread object needed for a
+        deterministic join.  Its worker closure captures that queue, which
+        lets us identify the exact newly-created thread without relying on a
+        Fish-specific thread name.
+        """
+        new_threads = [
+            thread for thread in threading.enumerate()
+            if thread not in threads_before and thread.is_alive()
+        ]
+        for thread in new_threads:
+            target = getattr(thread, "_target", None)
+            closure = getattr(target, "__closure__", None) or ()
+            for cell in closure:
+                try:
+                    if cell.cell_contents is llama_queue:
+                        return thread
+                except ValueError:
+                    # An empty closure cell cannot refer to the queue.
+                    continue
+
+        # Current Fish versions create exactly one Python thread in the
+        # launcher.  Keep that safe fallback for builds whose worker callable
+        # doesn't expose an inspectable closure.
+        if len(new_threads) == 1:
+            return new_threads[0]
+        return None
+
+    def close(self, timeout: float = 30.0):
+        """Release model resources, including Fish's semantic worker thread."""
+        model = self.model
+        self.model = None
+        self._fish_types = None
+
+        if self.backend != "fishaudio":
+            return
+
+        llama_queue = self._fish_llama_queue
+        if llama_queue is None and model is not None:
+            llama_queue = getattr(model, "llama_queue", None)
+        worker_thread = self._fish_worker_thread
+        self._fish_llama_queue = None
+        self._fish_worker_thread = None
+
+        # None is Fish Speech's documented internal stop sentinel.  Merely
+        # dropping TTSInferenceEngine leaves this worker blocked on get(), with
+        # the semantic model and its CUDA cache still referenced on its stack.
+        if llama_queue is not None and (
+            worker_thread is None or worker_thread.is_alive()
+        ):
+            llama_queue.put(None)
+
+        shutdown_error = None
+        if llama_queue is not None and worker_thread is None:
+            shutdown_error = RuntimeError(
+                "Could not identify the Fish Speech model worker; shutdown "
+                "was requested but cannot be confirmed"
+            )
+        elif worker_thread is not None and worker_thread.is_alive():
+            worker_thread.join(timeout=timeout)
+            if worker_thread.is_alive():
+                shutdown_error = RuntimeError(
+                    "Timed out waiting for the Fish Speech model worker to stop"
+                )
+
+        if model is not None:
+            # Reference caches can contain CUDA token tensors.  Clear and
+            # detach them explicitly before the server runs gc/empty_cache.
+            for cache_name in ("ref_by_id", "ref_by_hash"):
+                cache = getattr(model, cache_name, None)
+                if hasattr(cache, "clear"):
+                    cache.clear()
+            if hasattr(model, "llama_queue"):
+                model.llama_queue = None
+            if hasattr(model, "decoder_model"):
+                model.decoder_model = None
+
+        if shutdown_error is not None:
+            raise shutdown_error
 
     def _resolve_generation_params(self, segment: dict, script_generation: dict) -> dict:
         if self.backend == "voxcpm":
@@ -543,7 +651,10 @@ class Vocalizer:
         voice_prompt = segment.get("voice_prompt")
         if voice_prompt:
             # S2 supports natural-language inline control tags.
-            text = f"[{voice_prompt}]{text}"
+            if (not text.startswith("[")):
+                text = f"[{voice_prompt}] {text}"
+            else:
+                text = f"[{voice_prompt}]{text}"
 
         # Fish has one reference mechanism. Prefer the API's transcript-aware
         # prompt_ref path, while accepting ref for compatibility with ordinary

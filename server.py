@@ -340,19 +340,37 @@ def _create_vocalizer() -> Vocalizer:
 
 def _release_vocalizer(vocalizer: Vocalizer):
     """Release model references and return cached accelerator memory."""
-    # The awaiting coroutine retains the lightweight Vocalizer wrapper until
-    # this function returns, so detach the heavyweight model explicitly before
-    # collecting objects and clearing the allocator cache.
-    vocalizer.model = None
-    gc.collect()
     try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        # CPU-only installations and partially initialized CUDA runtimes don't
-        # need any additional cleanup.
-        pass
+        # Fish Speech's semantic model lives on a background thread.  close()
+        # sends that worker its stop sentinel and joins it before detaching the
+        # decoder and reference-token cache.
+        vocalizer.close()
+    finally:
+        # The awaiting coroutine retains the lightweight wrapper until this
+        # function returns, but close() has detached its heavyweight objects.
+        gc.collect()
+        try:
+            import torch
+        except Exception:
+            torch = None
+
+        if torch is not None and torch.cuda.is_available():
+            # Ensure queued kernels are complete before returning unused
+            # allocator blocks to the CUDA driver for the other process.  Run
+            # each cleanup independently so one unsupported operation doesn't
+            # prevent empty_cache(), which is the essential release step.
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
 
 
 async def _render_worker():
