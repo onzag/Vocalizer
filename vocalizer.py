@@ -1,15 +1,40 @@
 import glob
+import json
 import os
 import random
 import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Union
 
 import numpy as np
 import soundfile as sf
 
 DEFAULT_VOXCPM_MODEL_ID = "openbmb/VoxCPM2"
-DEFAULT_FISH_AUDIO_S2_MODEL_ID = "checkpoints/s2-pro"
+DEFAULT_FISH_AUDIO_S2_MODEL_ID = "fish-speech-checkpoints/s2-pro"
+ENGINE_CONFIG_DIRECTORY = Path(__file__).resolve().parent
+
+ENGINE_CONFIG_DEFAULTS = {
+    "voxcpm": {
+        "model_id": DEFAULT_VOXCPM_MODEL_ID,
+        "load_denoiser": False,
+        "cfg_value": 2.0,
+        "inference_timesteps": 10,
+    },
+    "fishaudio": {
+        "model_id": DEFAULT_FISH_AUDIO_S2_MODEL_ID,
+        "decoder_checkpoint_path": None,
+        "decoder_config_name": "modded_dac_vq",
+        "device": None,
+        "half": False,
+        "compile": False,
+        "max_new_tokens": 1024,
+        "chunk_length": 200,
+        "top_p": 0.8,
+        "repetition_penalty": 1.1,
+        "temperature": 0.8,
+    },
+}
 
 # --------------------------------------------------------------------------
 # Config
@@ -19,22 +44,58 @@ DEFAULT_FISH_AUDIO_S2_MODEL_ID = "checkpoints/s2-pro"
 class VocalizerConfig:
     sound_library_dir: str = "./sounds"
     output_sample_rate: int = 48000
-    load_denoiser: bool = False
-    cfg_value: float = 2.0
-    inference_timesteps: int = 10
     crossfade_ms: int = 15
     target_loudness_db: float = -20.0   # RMS target every clip is normalized to before volume gain
-    model_id: Optional[str] = None
-    fish_decoder_checkpoint_path: Optional[str] = None
-    fish_decoder_config_name: str = "modded_dac_vq"
-    fish_device: Optional[str] = None
-    fish_half: bool = False
-    fish_compile: bool = False
-    fish_max_new_tokens: int = 1024
-    fish_chunk_length: int = 200
-    fish_top_p: float = 0.8
-    fish_repetition_penalty: float = 1.1
-    fish_temperature: float = 0.8
+
+
+def resolve_backend() -> str:
+    """Return the selected engine name from the environment."""
+    raw_backend = os.getenv("VOCALIZER_MODE", os.getenv("VOCALIZER_BACKEND", "voxcpm"))
+    backend = raw_backend.strip().lower().replace("-", "_")
+    aliases = {
+        "voxcpm": "voxcpm",
+        "vox_cpm": "voxcpm",
+        "fishaudio": "fishaudio",
+        "fish": "fishaudio",
+        "fish_speech": "fishaudio",
+        "fish_audio": "fishaudio",
+        "fish_audio_s2": "fishaudio",
+        "s2": "fishaudio",
+    }
+    try:
+        return aliases[backend]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported vocalizer backend {raw_backend!r}; expected 'voxcpm' or 'fishaudio'"
+        ) from exc
+
+
+def load_engine_config(backend: str) -> tuple:
+    """Create the selected engine's config when missing, then load it."""
+    defaults = ENGINE_CONFIG_DEFAULTS[backend]
+    config_path = ENGINE_CONFIG_DIRECTORY / f".config-{backend}.json"
+
+    if not config_path.exists():
+        try:
+            with config_path.open("x", encoding="utf-8") as config_file:
+                json.dump(defaults, config_file, indent=2)
+                config_file.write("\n")
+        except FileExistsError:
+            # Another initializer created it between exists() and open().
+            pass
+
+    try:
+        with config_path.open("r", encoding="utf-8") as config_file:
+            loaded = json.load(config_file)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in engine config {config_path}: {exc}") from exc
+
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Engine config {config_path} must contain a JSON object")
+
+    config = dict(defaults)
+    config.update(loaded)
+    return config, config_path
 
 
 # --------------------------------------------------------------------------
@@ -303,52 +364,17 @@ class Vocalizer:
         self.config = config
         self.library = SoundLibrary(config.sound_library_dir)
         self.model = None
-        self.backend = self._resolve_backend()
-        self.model_id = self._resolve_model_id()
+        self.backend = resolve_backend()
+        self.engine_config, self.engine_config_path = load_engine_config(self.backend)
+        self.model_id = self.engine_config.get("model_id")
+        if not isinstance(self.model_id, str) or not self.model_id.strip():
+            raise ValueError(f"{self.engine_config_path}: model_id must be a non-empty string")
         self._fish_types = None
 
         if self.backend == "voxcpm":
             self._load_voxcpm()
         else:
             self._load_fish_audio_s2()
-
-    @staticmethod
-    def _resolve_backend() -> str:
-        raw_backend = os.getenv("VOCALIZER_MODE", os.getenv("VOCALIZER_BACKEND", "voxcpm"))
-        backend = raw_backend.strip().lower().replace("-", "_")
-        aliases = {
-            "voxcpm": "voxcpm",
-            "vox_cpm": "voxcpm",
-            "fish": "fish_audio_s2",
-            "fish_speech": "fish_audio_s2",
-            "fish_audio": "fish_audio_s2",
-            "fish_audio_s2": "fish_audio_s2",
-            "s2": "fish_audio_s2",
-        }
-        try:
-            return aliases[backend]
-        except KeyError as exc:
-            choices = "voxcpm or fish_audio_s2"
-            raise ValueError(f"Unsupported VOCALIZER_MODE {raw_backend!r}; expected {choices}") from exc
-
-    def _resolve_model_id(self) -> str:
-        if self.config.model_id:
-            return self.config.model_id
-
-        env_model_id = os.getenv("VOCALIZER_MODEL_ID")
-        if env_model_id:
-            return env_model_id
-
-        legacy_model_id = self.config.voxcpm_model_id
-        if legacy_model_id:
-            # server.py and main.py currently pass their VoxCPM default through
-            # the legacy field. Do not accidentally use it as an S2 checkpoint.
-            if self.backend == "voxcpm" or legacy_model_id != DEFAULT_VOXCPM_MODEL_ID:
-                return legacy_model_id
-
-        if self.backend == "voxcpm":
-            return DEFAULT_VOXCPM_MODEL_ID
-        return DEFAULT_FISH_AUDIO_S2_MODEL_ID
 
     def _load_voxcpm(self):
         try:
@@ -359,11 +385,11 @@ class Vocalizer:
         if VoxCPM is None:
             raise ImportError(
                 "VoxCPM mode requires the 'voxcpm' package. "
-                "Set VOCALIZER_MODE=fish_audio_s2 only when Fish Speech is installed."
+                "Set VOCALIZER_MODE=fishaudio only when Fish Speech is installed."
             )
         self.model = VoxCPM.from_pretrained(
             self.model_id,
-            load_denoiser=self.config.load_denoiser,
+            load_denoiser=self.engine_config["load_denoiser"],
         )
 
     def _load_fish_audio_s2(self):
@@ -379,25 +405,31 @@ class Vocalizer:
                 "(the 'fish_speech' package); no API server is used."
             ) from exc
 
-        checkpoint_path = os.path.abspath(os.path.expanduser(self.model_id))
-        decoder_checkpoint_path = self.config.fish_decoder_checkpoint_path
-        if decoder_checkpoint_path is None:
-            decoder_checkpoint_path = os.path.join(checkpoint_path, "codec.pth")
-        else:
-            decoder_checkpoint_path = os.path.abspath(os.path.expanduser(decoder_checkpoint_path))
+        checkpoint_path = Path(self.model_id).expanduser()
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = self.engine_config_path.parent / checkpoint_path
+        checkpoint_path = checkpoint_path.resolve()
 
-        if not os.path.isdir(checkpoint_path):
+        decoder_checkpoint_path = self.engine_config.get("decoder_checkpoint_path")
+        if decoder_checkpoint_path is None:
+            decoder_checkpoint_path = checkpoint_path / "codec.pth"
+        else:
+            decoder_checkpoint_path = Path(decoder_checkpoint_path).expanduser()
+            if not decoder_checkpoint_path.is_absolute():
+                decoder_checkpoint_path = self.engine_config_path.parent / decoder_checkpoint_path
+            decoder_checkpoint_path = decoder_checkpoint_path.resolve()
+
+        if not checkpoint_path.is_dir():
             raise FileNotFoundError(
                 f"Fish Audio S2 checkpoint directory not found: {checkpoint_path}. "
-                "Download fishaudio/s2-pro locally and set VOCALIZER_MODEL_ID "
-                "or VocalizerConfig.model_id to that directory."
+                f"Update model_id in {self.engine_config_path}."
             )
-        if not os.path.isfile(decoder_checkpoint_path):
+        if not decoder_checkpoint_path.is_file():
             raise FileNotFoundError(
                 f"Fish Audio S2 codec checkpoint not found: {decoder_checkpoint_path}"
             )
 
-        device = self.config.fish_device
+        device = self.engine_config.get("device")
         if device is None:
             if torch.cuda.is_available():
                 device = "cuda"
@@ -408,42 +440,45 @@ class Vocalizer:
             else:
                 device = "cpu"
 
-        precision = torch.float16 if self.config.fish_half else torch.bfloat16
+        precision = torch.float16 if self.engine_config["half"] else torch.bfloat16
         llama_queue = launch_thread_safe_queue(
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=str(checkpoint_path),
             device=device,
             precision=precision,
-            compile=self.config.fish_compile,
+            compile=self.engine_config["compile"],
         )
         decoder_model = load_decoder_model(
-            config_name=self.config.fish_decoder_config_name,
-            checkpoint_path=decoder_checkpoint_path,
+            config_name=self.engine_config["decoder_config_name"],
+            checkpoint_path=str(decoder_checkpoint_path),
             device=device,
         )
         self.model = TTSInferenceEngine(
             llama_queue=llama_queue,
             decoder_model=decoder_model,
             precision=precision,
-            compile=self.config.fish_compile,
+            compile=self.engine_config["compile"],
         )
         self._fish_types = (ServeReferenceAudio, ServeTTSRequest)
 
     def _resolve_generation_params(self, segment: dict, script_generation: dict) -> dict:
         if self.backend == "voxcpm":
-            params = {"cfg_value": self.config.cfg_value, "inference_timesteps": self.config.inference_timesteps}
+            params = {
+                "cfg_value": self.engine_config["cfg_value"],
+                "inference_timesteps": self.engine_config["inference_timesteps"],
+            }
             params.update(script_generation or {})
-            allowed = ("cfg_value", "inference_timesteps", "normalize", "denoise", "seed")
+            allowed = ("cfg_value", "normalize", "denoise", "seed")
         else:
             params = {
-                "max_new_tokens": self.config.fish_max_new_tokens,
-                "chunk_length": self.config.fish_chunk_length,
-                "top_p": self.config.fish_top_p,
-                "repetition_penalty": self.config.fish_repetition_penalty,
-                "temperature": self.config.fish_temperature,
+                "max_new_tokens": self.engine_config["max_new_tokens"],
+                "chunk_length": self.engine_config["chunk_length"],
+                "top_p": self.engine_config["top_p"],
+                "repetition_penalty": self.engine_config["repetition_penalty"],
+                "temperature": self.engine_config["temperature"],
             }
             allowed = (
                 "max_new_tokens", "chunk_length", "top_p",
-                "repetition_penalty", "temperature", "normalize", "seed",
+                "repetition_penalty", "temperature"
             )
         for key in allowed:
             if key in (script_generation or {}):
@@ -453,9 +488,12 @@ class Vocalizer:
         return params
 
     def _render_speech(self, segment: dict, script_generation: dict) -> np.ndarray:
-        if self.backend == "fish_audio_s2":
+        if self.backend == "fishaudio":
             return self._render_fish_speech(segment, script_generation)
+        else:
+            return self._render_voxcpm_speech(segment, script_generation)
 
+    def _render_voxcpm_speech(self, segment: dict, script_generation: dict) -> np.ndarray:
         ref = segment.get("ref")
         text = segment["text"]
         voice_prompt = segment.get("voice_prompt")

@@ -26,6 +26,16 @@ python server.py
 | `HOST` | 0.0.0.0 | Host to run the server on |
 | `DEV` | 0 | If set to 1, the server will run in development mode and use dev-secret-12345678900abcdef instead of the default secret, among other dev specific things |
 | `ENABLE_UNLOAD` | 0 | If set to 1, the server will allow clients to unload the model from memory. This will cause the model not to be pre-warmed on start and enables a function to unload the model |
+| `VOCALIZER_MODE` | `voxcpm` | Speech engine: `voxcpm` or `fishaudio`. Takes precedence over `VOCALIZER_BACKEND` when both are set |
+| `VOCALIZER_BACKEND` | `voxcpm` | Alternative variable for selecting `voxcpm` or `fishaudio` |
+| `VOCALIZER_SAMPLE_RATE` | 48000 | Output sample rate used by the server |
+
+The selected engine creates and loads its own configuration file beside
+`vocalizer.py`: `.config-voxcpm.json` or `.config-fishaudio.json`. Model IDs,
+model-loading options, and engine-specific generation defaults belong in that
+file. If the file does not exist, it is created with defaults when the model is
+first loaded. Restart the server after changing it. See [README.md](README.md)
+for the complete default configurations.
 
 ## Actions
 

@@ -44,7 +44,7 @@ import websockets
 from websockets.http11 import Response
 from websockets.datastructures import Headers
 
-from vocalizer import Vocalizer, VocalizerConfig, SoundLibrary
+from vocalizer import Vocalizer, VocalizerConfig, SoundLibrary, resolve_backend
 
 # ── Configuration ─────────────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8222"))
@@ -65,7 +65,7 @@ STREAM_CHUNK_BYTES = 64 * 1024            # size of binary frames sent to client
 SUPPORTED_OUTPUT_FORMATS = {"mp3": "MP3"}
 DEFAULT_OUTPUT_FORMAT = "mp3"
 
-MODEL_ID = os.getenv("VOCALIZER_MODEL_ID", "openbmb/VoxCPM2")
+BACKEND = resolve_backend()
 SAMPLE_RATE = int(os.getenv("VOCALIZER_SAMPLE_RATE", "48000"))
 
 SERVER_START_TIME = time.time()
@@ -133,13 +133,14 @@ def _mb(n: int) -> str:
 
 
 def _render_index_html() -> str:
+    model_id = VOCALIZER.model_id if VOCALIZER is not None else f"{BACKEND} (not loaded)"
     replacements = {
         "PROTOCOL": "wss",
         "PORT": str(PORT),
         "DEV_MODE": "DEV (insecure secret)" if DEV else "production",
         "SSL_MODE": "enabled",
         "MODEL_LOADED": "yes" if (VOCALIZER is not None and VOCALIZER.model is not None) else "no",
-        "MODEL_ID": _html_escape(MODEL_ID),
+        "MODEL_ID": _html_escape(model_id),
         "SAMPLE_RATE": str(SAMPLE_RATE),
         "OUTPUT_FORMATS": ", ".join(SUPPORTED_OUTPUT_FORMATS.keys()),
         "MAX_UPLOAD": _mb(MAX_UPLOAD_BYTES),
@@ -333,7 +334,6 @@ def _render_blocking(vocalizer: Vocalizer, payload: dict, session_dir: str) -> n
 def _create_vocalizer() -> Vocalizer:
     """Construct and load a fresh Vocalizer model."""
     return Vocalizer(VocalizerConfig(
-        voxcpm_model_id=MODEL_ID,
         output_sample_rate=SAMPLE_RATE,
     ))
 
@@ -580,7 +580,7 @@ async def _handle_load_model(websocket, rid: str):
 
     async with MODEL_LOCK:
         if VOCALIZER is None:
-            print(f"[model] {rid}: loading {MODEL_ID}...")
+            print(f"[model] {rid}: loading {BACKEND}...")
             loop = asyncio.get_running_loop()
             VOCALIZER = await loop.run_in_executor(None, _create_vocalizer)
             print(f"[model] {rid}: loaded.")
@@ -671,7 +671,7 @@ async def main():
     if ENABLE_UNLOAD:
         print("Model loading deferred because ENABLE_UNLOAD=1.")
     else:
-        print(f"Loading model {MODEL_ID}...")
+        print(f"Loading {BACKEND} model...")
         VOCALIZER = _create_vocalizer()
         print("Model loaded.")
 

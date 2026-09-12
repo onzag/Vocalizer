@@ -35,3 +35,7 @@ secret
 
 fish-speech/
 fish-speech-*
+
+# config
+
+.config-*.json
